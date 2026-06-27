@@ -181,28 +181,54 @@ validate_config() {
     # Required fields
     if [[ -z "${REMOTE_USER:-}" ]]; then
         log_error "REMOTE_USER is not set"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if [[ -z "${REMOTE_HOST:-}" ]]; then
         log_error "REMOTE_HOST is not set"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if [[ -z "${LOCAL_DIR:-}" ]]; then
         log_error "LOCAL_DIR is not set"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if [[ -z "${REMOTE_DIR:-}" ]]; then
         log_error "REMOTE_DIR is not set"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
+    fi
+
+    # --- Security: reject shell-unsafe characters in values used in SSH commands ---
+
+    # REMOTE_USER is interpolated into "user@host" passed to ssh.
+    # Allow only the characters valid in a Unix username.
+    if [[ -n "${REMOTE_USER:-}" ]] && ! [[ "$REMOTE_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        log_error "REMOTE_USER contains invalid characters (allowed: letters, digits, dot, dash, underscore): $REMOTE_USER"
+        errors=$(( errors + 1 ))
+    fi
+
+    # REMOTE_DIR is embedded in single-quoted remote shell commands like
+    # "test -d '$REMOTE_DIR'". A single quote in the value breaks that quoting
+    # and allows arbitrary remote command injection.
+    if [[ -n "${REMOTE_DIR:-}" ]] && [[ "$REMOTE_DIR" == *"'"* ]]; then
+        log_error "REMOTE_DIR must not contain single quotes"
+        errors=$(( errors + 1 ))
+    fi
+
+    # SSH_IDENTITY is appended unquoted to the ssh command string that is later
+    # word-split. A value like "/key -oProxyCommand=/evil" injects extra SSH
+    # options, allowing full MITM. Allow paths with no whitespace or shell
+    # metacharacters.
+    if [[ -n "${SSH_IDENTITY:-}" ]] && [[ "$SSH_IDENTITY" =~ [[:space:]\;\|\&\`\$\<\>\(\)\{\}] ]]; then
+        log_error "SSH_IDENTITY path must not contain whitespace or shell metacharacters: $SSH_IDENTITY"
+        errors=$(( errors + 1 ))
     fi
 
     # Validate local directory exists
     if [[ -n "${LOCAL_DIR:-}" ]] && [[ ! -d "$LOCAL_DIR" ]]; then
         log_error "LOCAL_DIR does not exist: $LOCAL_DIR"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     # Validate conflict strategy
@@ -210,14 +236,14 @@ validate_config() {
         newest|skip|backup|local|remote) ;;
         *)
             log_error "Invalid CONFLICT_STRATEGY: $CONFLICT_STRATEGY (must be: newest, skip, backup, local, remote)"
-            (( errors++ ))
+            errors=$(( errors + 1 ))
             ;;
     esac
 
     # Validate port
     if [[ -n "${REMOTE_PORT:-}" ]] && ! [[ "$REMOTE_PORT" =~ ^[0-9]+$ ]]; then
         log_error "REMOTE_PORT must be a number: $REMOTE_PORT"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     # Validate log level
@@ -225,9 +251,22 @@ validate_config() {
         DEBUG|INFO|WARN|ERROR) ;;
         *)
             log_error "Invalid LOG_LEVEL: $LOG_LEVEL (must be: DEBUG, INFO, WARN, ERROR)"
-            (( errors++ ))
+            errors=$(( errors + 1 ))
             ;;
     esac
+
+    # EXCLUDE_PATTERNS entries are embedded inside single-quoted strings in a
+    # remote shell heredoc. A pattern containing a single quote or semicolon
+    # breaks that quoting and can execute arbitrary commands on the remote host.
+    if [[ -n "${EXCLUDE_PATTERNS+x}" ]]; then
+        local p
+        for p in "${EXCLUDE_PATTERNS[@]}"; do
+            if [[ "$p" == *"'"* || "$p" == *";"* || "$p" == *'`'* || "$p" == *'$'* ]]; then
+                log_error "EXCLUDE_PATTERNS entry contains shell-unsafe characters (', ;, \`, \$): $p"
+                errors=$(( errors + 1 ))
+            fi
+        done
+    fi
 
     if (( errors > 0 )); then
         log_error "Configuration validation failed with $errors error(s)"
@@ -585,7 +624,7 @@ rotate_backups() {
     local count=0
     while IFS= read -r -d '' file; do
         rm -f "$file"
-        (( count++ ))
+        count=$(( count + 1 ))
     done < <(find "$backup_dir" -type f -mtime +"$max_age" -print0 2>/dev/null)
 
     # Remove empty directories left behind
@@ -607,6 +646,7 @@ acquire_lock() {
     mkdir -p "$state_dir"
     LOCK_FILE="${state_dir}/${profile}.lock"
 
+    # If a lock exists, check whether the owning process is still alive.
     if [[ -f "$LOCK_FILE" ]]; then
         local lock_pid
         lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
@@ -617,12 +657,17 @@ acquire_lock() {
             return 1
         fi
 
-        # Stale lock - remove it
-        log_warn "Removing stale lock file (PID $lock_pid is not running)"
+        log_warn "Removing stale lock file (PID ${lock_pid:-unknown} is not running)"
         rm -f "$LOCK_FILE"
     fi
 
-    echo $$ > "$LOCK_FILE"
+    # Atomic creation: noclobber makes the redirect fail if the file already
+    # exists, closing the TOCTOU window between the check above and the write.
+    if ! ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null; then
+        log_error "Failed to acquire lock (another sync may have just started): $LOCK_FILE"
+        return 1
+    fi
+
     log_debug "Lock acquired: $LOCK_FILE (PID $$)"
     return 0
 }

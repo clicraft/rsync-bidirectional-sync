@@ -81,12 +81,16 @@ generate_remote_manifest() {
         ssh_opts+=(-i "$SSH_IDENTITY")
     fi
 
-    # Build exclude arguments for find on remote
+    # Build exclude arguments for find on remote.
+    # Escape single quotes in each pattern so they cannot break out of the
+    # surrounding '...' quoting in the heredoc (defense-in-depth; primary
+    # guard is validate_config rejecting unsafe patterns).
     local exclude_script=""
     if [[ -n "${EXCLUDE_PATTERNS+x}" ]]; then
         for pattern in "${EXCLUDE_PATTERNS[@]}"; do
             local clean="${pattern%/}"
-            exclude_script+=" -not -path '*/${clean}' -not -path '*/${clean}/*'"
+            local safe="${clean//\'/\'\\\'\'}"
+            exclude_script+=" -not -path '*/${safe}' -not -path '*/${safe}/*'"
         done
     fi
     exclude_script+=" -not -path '*/.sync-backups' -not -path '*/.sync-backups/*'"

@@ -385,14 +385,20 @@ run_sync() {
     fi
 
     # Step 7: Run notification hooks
+    # Intentionally word-split ON_FAILURE/ON_COMPLETE so users can write
+    # "notify-send -u critical" (command + flags), with the message appended.
+    # No eval: the message text is always passed as a single quoted argument,
+    # so it cannot inject additional shell commands.
     if (( SYNC_ERRORS > 0 )); then
         if [[ -n "${ON_FAILURE:-}" ]]; then
-            eval "$ON_FAILURE 'Sync completed with $SYNC_ERRORS error(s)'" 2>/dev/null || true
+            # shellcheck disable=SC2086
+            $ON_FAILURE "Sync completed with $SYNC_ERRORS error(s)" 2>/dev/null || true
         fi
         return 1
     else
         if [[ -n "${ON_COMPLETE:-}" ]]; then
-            eval "$ON_COMPLETE 'Sync complete: pushed=$SYNC_PUSHED pulled=$SYNC_PULLED'" 2>/dev/null || true
+            # shellcheck disable=SC2086
+            $ON_COMPLETE "Sync complete: pushed=$SYNC_PUSHED pulled=$SYNC_PULLED" 2>/dev/null || true
         fi
         return 0
     fi
