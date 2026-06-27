@@ -451,12 +451,19 @@ run_status() {
 
         has_changes=1
 
+        # Strip control characters from the path (an attacker-influenced file
+        # name) so it cannot inject terminal escape sequences that forge or hide
+        # status lines. Use printf '%s' rather than `echo -e`, which would also
+        # interpret literal backslash-escape text embedded in the name.
+        local safe_path
+        sanitize_for_terminal safe_path "$path"
+
         case "$action" in
-            PUSH)          echo -e "  ${C_GREEN}→ PUSH${C_RESET}          $path" ;;
-            PULL)          echo -e "  ${C_BLUE}← PULL${C_RESET}          $path" ;;
-            DELETE_LOCAL)  echo -e "  ${C_RED}✗ DEL LOCAL${C_RESET}     $path" ;;
-            DELETE_REMOTE) echo -e "  ${C_RED}✗ DEL REMOTE${C_RESET}    $path" ;;
-            CONFLICT)      echo -e "  ${C_YELLOW}⚡ CONFLICT${C_RESET}     $path" ;;
+            PUSH)          printf '  %b→ PUSH%b          %s\n'       "$C_GREEN"  "$C_RESET" "$safe_path" ;;
+            PULL)          printf '  %b← PULL%b          %s\n'       "$C_BLUE"   "$C_RESET" "$safe_path" ;;
+            DELETE_LOCAL)  printf '  %b✗ DEL LOCAL%b     %s\n'       "$C_RED"    "$C_RESET" "$safe_path" ;;
+            DELETE_REMOTE) printf '  %b✗ DEL REMOTE%b    %s\n'       "$C_RED"    "$C_RESET" "$safe_path" ;;
+            CONFLICT)      printf '  %b⚡ CONFLICT%b     %s\n'        "$C_YELLOW" "$C_RESET" "$safe_path" ;;
         esac
     done <<< "$actions"
 
