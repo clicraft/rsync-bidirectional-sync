@@ -219,7 +219,7 @@ sync-client -p work -v -n
 
 ## Safety Features
 
-- **Lock files** - Prevents concurrent sync runs (with stale lock detection)
+- **Lock files** - Prevents concurrent sync runs using a kernel `flock` lock that releases automatically if the process dies (no stale locks); falls back to PID-based stale-lock detection where `flock` is unavailable
 - **Signal handling** - Clean shutdown on Ctrl+C or SIGTERM
 - **Manifest-based deletions** - Only propagates intentional deletes
 - **Backup on conflict** - Optional backup before overwriting
