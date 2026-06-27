@@ -77,6 +77,15 @@ _should_log() {
     (( msg_int >= configured_int ))
 }
 
+# Replace control bytes (ESC, CR, NL, BEL, etc.) with '?' so attacker-
+# controlled strings such as file names or remote output cannot inject
+# terminal escape sequences into our output or persist them into log files
+# (where they would re-fire whenever the log is later `cat`ed). Writes the
+# cleaned value into the variable named by $1 (no subshell/fork).
+sanitize_for_terminal() {
+    printf -v "$1" '%s' "${2//[[:cntrl:]]/?}"
+}
+
 _log() {
     local level="$1"
     shift
@@ -88,6 +97,11 @@ _log() {
         return 0
     fi
 
+    # Strip control characters from the (possibly attacker-influenced) message
+    # before it reaches the terminal or the log file.
+    local safe_message
+    sanitize_for_terminal safe_message "$message"
+
     local color=""
     case "$level" in
         DEBUG) color="$C_CYAN" ;;
@@ -97,11 +111,11 @@ _log() {
     esac
 
     # Print to stderr (so stdout stays clean for machine-readable output)
-    printf "${color}[%s] [%-5s]${C_RESET} %s\n" "$timestamp" "$level" "$message" >&2
+    printf "${color}[%s] [%-5s]${C_RESET} %s\n" "$timestamp" "$level" "$safe_message" >&2
 
     # Append to log file if set
     if [[ -n "${LOG_FILE:-}" ]] && [[ -d "$(dirname "$LOG_FILE")" ]]; then
-        printf "[%s] [%-5s] %s\n" "$timestamp" "$level" "$message" >> "$LOG_FILE" 2>/dev/null || true
+        printf "[%s] [%-5s] %s\n" "$timestamp" "$level" "$safe_message" >> "$LOG_FILE" 2>/dev/null || true
     fi
 }
 
