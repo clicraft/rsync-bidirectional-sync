@@ -33,6 +33,7 @@ VERBOSE="false"
 FORCE="false"
 ACTION="sync"   # sync, status, reset-state, delete-backups
 DELETE_NOW="false"
+KEEP_BACKUPS_OVERRIDE=""
 
 # ============================================================================
 # USAGE / HELP
@@ -52,13 +53,14 @@ ${C_BOLD}COMMANDS:${C_RESET}
     delete-backups  Delete backups older than BACKUP_MAX_AGE_DAYS (--now for all)
 
 ${C_BOLD}OPTIONS:${C_RESET}
-    -p, --profile NAME    Use named profile (default: \"default\")
-    -n, --dry-run         Show what would happen without making changes
-    -v, --verbose         Enable verbose output (DEBUG log level)
-    -f, --force           Skip confirmation prompts
-    -c, --config FILE     Use specific config file
-    -h, --help            Show this help message
-    -V, --version         Show version information
+    -p, --profile NAME         Use named profile (default: \"default\")
+    -n, --dry-run              Show what would happen without making changes
+    -v, --verbose              Enable verbose output (DEBUG log level)
+    -f, --force                Skip confirmation prompts
+    -c, --config FILE          Use specific config file
+        --keep-backups DAYS    Override BACKUP_MAX_AGE_DAYS from config
+    -h, --help                 Show this help message
+    -V, --version              Show version information
 
 ${C_BOLD}EXAMPLES:${C_RESET}
     sync-client                       # Run sync with default profile
@@ -102,6 +104,10 @@ parse_args() {
                     log_error "--profile requires a name"
                     exit 1
                 fi
+                if ! [[ "${2}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                    log_error "--profile name must contain only letters, digits, dash, or underscore: ${2}"
+                    exit 1
+                fi
                 PROFILE_NAME="$2"
                 shift 2
                 ;;
@@ -127,6 +133,19 @@ parse_args() {
                     exit 1
                 fi
                 CONFIG_FILE="$2"
+                shift 2
+                ;;
+
+            --keep-backups)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--keep-backups requires a number of days"
+                    exit 1
+                fi
+                if ! [[ "${2}" =~ ^[0-9]+$ ]]; then
+                    log_error "--keep-backups value must be a non-negative integer: ${2}"
+                    exit 1
+                fi
+                KEEP_BACKUPS_OVERRIDE="$2"
                 shift 2
                 ;;
 
@@ -317,6 +336,12 @@ main() {
     # Resolve and load configuration
     resolve_config
     load_config "$CONFIG_FILE"
+
+    # CLI flag overrides config value (must come after load_config)
+    if [[ -n "$KEEP_BACKUPS_OVERRIDE" ]]; then
+        BACKUP_MAX_AGE_DAYS="$KEEP_BACKUPS_OVERRIDE"
+        log_debug "Backup retention overridden by --keep-backups: ${BACKUP_MAX_AGE_DAYS} days"
+    fi
 
     # Override log level again after config (CLI takes precedence)
     if [[ "$VERBOSE" == "true" ]]; then

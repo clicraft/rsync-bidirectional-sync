@@ -219,7 +219,7 @@ sync-client -p work -v -n
 
 ## Safety Features
 
-- **Lock files** - Prevents concurrent sync runs (with stale lock detection)
+- **Lock files** - Prevents concurrent sync runs using a kernel `flock` lock that releases automatically if the process dies (no stale locks); falls back to PID-based stale-lock detection where `flock` is unavailable
 - **Signal handling** - Clean shutdown on Ctrl+C or SIGTERM
 - **Manifest-based deletions** - Only propagates intentional deletes
 - **Backup on conflict** - Optional backup before overwriting
@@ -229,6 +229,50 @@ sync-client -p work -v -n
 - **State preservation on error** - Manifest only saved after full success
 - **Retry logic** - Configurable retries with backoff for network issues
 - **Version mismatch detection** - Pre-flight checks warn if local and remote run different versions (cached daily)
+
+## Security
+
+### SSH host key verification (recommended hardening)
+
+By default the tool connects with `StrictHostKeyChecking=accept-new`, which
+**automatically trusts a host the first time it is seen**. This keeps first-time
+setup frictionless, but it means a machine-in-the-middle present during that
+first connection (e.g. via DNS or ARP spoofing) can have its rogue host key
+silently accepted. From then on it controls the remote manifest, the
+transferred files, and remote command execution.
+
+To close this window, pin the remote host key **before** your first sync and
+switch SSH to strict checking:
+
+```bash
+# 1. Record the real remote host key (run on a trusted network)
+ssh-keyscan -p 22 -H remote-host >> ~/.ssh/known_hosts
+
+# 2. Verify the fingerprint out-of-band against the remote machine:
+#    on the remote, run:  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+#    and confirm it matches what ssh-keyscan recorded.
+
+# 3. Force strict checking for this host in ~/.ssh/config
+cat >> ~/.ssh/config <<'EOF'
+Host remote-host
+    StrictHostKeyChecking yes
+EOF
+```
+
+With the key pinned and `StrictHostKeyChecking yes`, any future host-key change
+(a real MITM, or a re-imaged server) causes the connection to **fail loudly**
+instead of being trusted silently.
+
+### Configuration values are trusted code
+
+Config and profile files are **sourced as Bash**, so anything in them runs with
+your privileges. Keep them private (`chmod 600`) and never sync a config file
+from an untrusted source. Connection-related values (`REMOTE_USER`,
+`REMOTE_HOST`, `REMOTE_DIR`, `SSH_IDENTITY`, `BACKUP_DIR`, `EXCLUDE_PATTERNS`)
+are additionally validated at startup and rejected if they contain shell
+metacharacters, so a templated or shared config cannot smuggle commands into the
+SSH/rsync calls. File names with embedded shell metacharacters are also quoted
+safely before reaching any remote command.
 
 ## File Structure
 

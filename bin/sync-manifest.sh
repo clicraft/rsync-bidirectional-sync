@@ -44,6 +44,17 @@ generate_local_manifest() {
                 # Strip leading ./
                 local relpath="${file#./}"
 
+                # The manifest is TAB/newline-delimited. A file name containing a
+                # tab or newline would forge extra manifest rows and corrupt the
+                # three-way diff, so skip it (and warn) rather than emit a
+                # malformed entry.
+                case "$relpath" in
+                    *$'\t'*|*$'\n'*)
+                        log_warn "Skipping file with tab/newline in name (unsafe for manifest): ${relpath//[$'\t\n']/?}"
+                        continue
+                        ;;
+                esac
+
                 local mtime size ftype
 
                 if [[ -L "$file" ]]; then
@@ -81,12 +92,16 @@ generate_remote_manifest() {
         ssh_opts+=(-i "$SSH_IDENTITY")
     fi
 
-    # Build exclude arguments for find on remote
+    # Build exclude arguments for find on remote.
+    # Escape single quotes in each pattern so they cannot break out of the
+    # surrounding '...' quoting in the heredoc (defense-in-depth; primary
+    # guard is validate_config rejecting unsafe patterns).
     local exclude_script=""
     if [[ -n "${EXCLUDE_PATTERNS+x}" ]]; then
         for pattern in "${EXCLUDE_PATTERNS[@]}"; do
             local clean="${pattern%/}"
-            exclude_script+=" -not -path '*/${clean}' -not -path '*/${clean}/*'"
+            local safe="${clean//\'/\'\\\'\'}"
+            exclude_script+=" -not -path '*/${safe}' -not -path '*/${safe}/*'"
         done
     fi
     exclude_script+=" -not -path '*/.sync-backups' -not -path '*/.sync-backups/*'"
@@ -103,6 +118,9 @@ cd '$dir'
 find . $exclude_script \( -type f -o -type l \) -print0 2>/dev/null \\
     | while IFS= read -r -d '' file; do
         relpath="\${file#./}"
+        case "\$relpath" in
+            *\$'\t'*|*\$'\n'*) continue ;;
+        esac
         if [ -L "\$file" ]; then
             ftype="l"
             mtime=\$(stat -c '%Y' "\$file" 2>/dev/null || echo 0)
@@ -143,7 +161,8 @@ remote_file_checksum() {
         ssh_opts+=(-i "$SSH_IDENTITY")
     fi
 
-    ssh "${ssh_opts[@]}" "${user}@${host}" "md5sum '$filepath' 2>/dev/null | cut -d' ' -f1" 2>/dev/null || echo ""
+    # filepath embeds a file name; quote it for the remote shell.
+    ssh "${ssh_opts[@]}" "${user}@${host}" "md5sum $(shquote "$filepath") 2>/dev/null | cut -d' ' -f1" 2>/dev/null || echo ""
 }
 
 # ============================================================================
