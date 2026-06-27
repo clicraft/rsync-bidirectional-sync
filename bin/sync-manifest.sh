@@ -274,8 +274,12 @@ three_way_diff() {
     for path in "${!local_map[@]}"; do all_paths["$path"]=1; done
     for path in "${!remote_map[@]}"; do all_paths["$path"]=1; done
 
-    # Classify each path
-    for path in $(echo "${!all_paths[@]}" | tr ' ' '\n' | sort); do
+    # Classify each path.
+    # Iterate via while-read over NUL-free, newline-delimited keys so that file
+    # names containing spaces or tabs are not split (the old `for path in
+    # $(echo ... | tr ' ' '\n')` mangled any path with a space).
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
         local in_prev=0 in_local=0 in_remote=0
         [[ -n "${prev_map[$path]+x}" ]] && in_prev=1
         [[ -n "${local_map[$path]+x}" ]] && in_local=1
@@ -345,7 +349,7 @@ three_way_diff() {
             log_debug "Deleted on both sides: $path"
 
         fi
-    done
+    done < <(printf '%s\n' "${!all_paths[@]}" | sort)
 }
 
 # ============================================================================
@@ -396,13 +400,14 @@ merge_manifests() {
         esac
     done <<< "$actions"
 
-    # Output merged manifest
-    for path in $(echo "${!merged[@]}" | tr ' ' '\n' | sort); do
+    # Output merged manifest (while-read so paths with spaces/tabs survive)
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
         local entry="${merged[$path]}"
         local mtime="${entry%%${_FIELD_SEP}*}"
         local rest="${entry#*${_FIELD_SEP}}"
         local size="${rest%%${_FIELD_SEP}*}"
         local ftype="${rest#*${_FIELD_SEP}}"
         printf '%s\t%s\t%s\t%s\n' "$path" "$mtime" "$size" "$ftype"
-    done
+    done < <(printf '%s\n' "${!merged[@]}" | sort)
 }
