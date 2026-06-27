@@ -186,7 +186,10 @@ load_config() {
         return 1
     fi
 
-    if [[ "$(stat -c%a "$config_file" 2>/dev/null)" =~ [0-7]*[0-7][67] ]]; then
+    # Warn if the "others" octal digit (the last one) grants read (4-7).
+    # Anchored to the last digit so e.g. 640 (group-only) is not falsely flagged;
+    # the old [67] test also missed others-read modes 4 (r--) and 5 (r-x).
+    if [[ "$(stat -c%a "$config_file" 2>/dev/null)" =~ [4-7]$ ]]; then
         log_warn "Config file $config_file is world-readable. Consider: chmod 600 $config_file"
     fi
 
@@ -786,7 +789,7 @@ cleanup() {
     fi
     _CLEANUP_DONE=1
 
-    log_warn "Cleaning up..."
+    log_info "Cleaning up..."
     release_lock
     log_info "Cleanup complete"
 }
