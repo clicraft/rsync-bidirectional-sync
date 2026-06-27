@@ -42,6 +42,12 @@ LOCK_FILE=""
 LOG_FILE=""
 _CLEANUP_DONE=0
 
+# Dedicated file descriptor for the flock-based lock (fixed number rather than
+# a {var}-assigned FD for bash 4.0 compatibility). LOCK_USES_FLOCK is set to 1
+# while a flock-based lock is held, so release_lock knows which path to take.
+readonly LOCK_FD=200
+LOCK_USES_FLOCK=0
+
 # ============================================================================
 # LOGGING
 # ============================================================================
@@ -201,10 +207,19 @@ validate_config() {
 
     # --- Security: reject shell-unsafe characters in values used in SSH commands ---
 
-    # REMOTE_USER is interpolated into "user@host" passed to ssh.
-    # Allow only the characters valid in a Unix username.
-    if [[ -n "${REMOTE_USER:-}" ]] && ! [[ "$REMOTE_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-        log_error "REMOTE_USER contains invalid characters (allowed: letters, digits, dot, dash, underscore): $REMOTE_USER"
+    # REMOTE_USER is interpolated into "user@host" passed to ssh. Restrict to a
+    # valid Unix username and forbid a leading dash so it cannot be parsed as an
+    # ssh option.
+    if [[ -n "${REMOTE_USER:-}" ]] && ! [[ "$REMOTE_USER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9._-]*$ ]]; then
+        log_error "REMOTE_USER is not a valid username (letters/digits/dot/dash/underscore, no leading dash): $REMOTE_USER"
+        errors=$(( errors + 1 ))
+    fi
+
+    # REMOTE_HOST flows into ssh, rsync targets, ping, and /dev/tcp. Restrict to
+    # hostname / IPv4 / IPv6 characters and forbid a leading dash so it cannot be
+    # parsed as a command-line option (e.g. `ping -f`).
+    if [[ -n "${REMOTE_HOST:-}" ]] && ! [[ "$REMOTE_HOST" =~ ^[a-zA-Z0-9_]([a-zA-Z0-9._:-]*)?$ ]]; then
+        log_error "REMOTE_HOST is not a valid hostname/IP (no leading dash, no shell metacharacters): $REMOTE_HOST"
         errors=$(( errors + 1 ))
     fi
 
@@ -217,11 +232,11 @@ validate_config() {
     fi
 
     # SSH_IDENTITY is appended unquoted to the ssh command string that is later
-    # word-split. A value like "/key -oProxyCommand=/evil" injects extra SSH
-    # options, allowing full MITM. Allow paths with no whitespace or shell
-    # metacharacters.
-    if [[ -n "${SSH_IDENTITY:-}" ]] && [[ "$SSH_IDENTITY" =~ [[:space:]\;\|\&\`\$\<\>\(\)\{\}] ]]; then
-        log_error "SSH_IDENTITY path must not contain whitespace or shell metacharacters: $SSH_IDENTITY"
+    # word-split and glob-expanded. A value with whitespace could inject extra
+    # SSH options (e.g. -oProxyCommand=...) enabling full MITM, and a glob could
+    # expand to multiple arguments. Restrict to a plain file path.
+    if [[ -n "${SSH_IDENTITY:-}" ]] && ! [[ "$SSH_IDENTITY" =~ ^[A-Za-z0-9._/~-]+$ ]]; then
+        log_error "SSH_IDENTITY must be a plain file path (letters/digits/._/~- only): $SSH_IDENTITY"
         errors=$(( errors + 1 ))
     fi
 
@@ -254,6 +269,18 @@ validate_config() {
             errors=$(( errors + 1 ))
             ;;
     esac
+
+    # BACKUP_DIR is joined to LOCAL_DIR/REMOTE_DIR and is the target of
+    # destructive `find ... -delete` during backup rotation. A value of '.',
+    # '..', an absolute path, or one containing '..' would point the deletion at
+    # the sync tree itself (or outside it) and destroy real data. Require a
+    # simple relative directory name.
+    if [[ -n "${BACKUP_DIR:-}" ]]; then
+        if [[ "$BACKUP_DIR" == /* || "$BACKUP_DIR" == "." || "$BACKUP_DIR" == ".." || "$BACKUP_DIR" == *".."* ]]; then
+            log_error "BACKUP_DIR must be a simple relative path inside the sync dir (no '.', '..', or absolute path): $BACKUP_DIR"
+            errors=$(( errors + 1 ))
+        fi
+    fi
 
     # EXCLUDE_PATTERNS entries are embedded inside single-quoted strings in a
     # remote shell heredoc. A pattern containing a single quote or semicolon
@@ -373,7 +400,7 @@ check_remote_dir() {
         ssh_opts+=(-i "$SSH_IDENTITY")
     fi
 
-    if ssh "${ssh_opts[@]}" "${user}@${host}" "test -d '$remote_dir'"; then
+    if ssh "${ssh_opts[@]}" "${user}@${host}" "test -d $(shquote "$remote_dir")"; then
         log_debug "Remote directory exists: $remote_dir"
         return 0
     fi
@@ -386,6 +413,16 @@ check_remote_dir() {
 # ============================================================================
 # SSH HELPER
 # ============================================================================
+
+# Emit a string as a single-quoted token that is safe to embed in a remote
+# POSIX shell command, regardless of its contents. Each embedded single quote
+# is rewritten as '\'' (close, escaped-quote, reopen). This neutralizes shell
+# metacharacters in attacker-controllable values such as file names, which
+# flow from the manifest/diff into remote `rm`/`mkdir`/`cp`/`md5sum` commands.
+shquote() {
+    local s=${1//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
 
 build_ssh_cmd() {
     local port="${REMOTE_PORT:-22}"
@@ -408,6 +445,7 @@ build_rsync_opts() {
     local opts=()
 
     opts+=(-a)                    # archive mode
+    opts+=(-s)                    # protect-args: no remote shell expansion of paths
     opts+=(--partial)             # keep partial files for resume
     opts+=(--progress)            # show progress
     opts+=(--human-readable)      # human readable sizes
@@ -502,13 +540,15 @@ rsync_push_file() {
 
     log_debug "Pushing: $remote_relative"
 
-    # Ensure remote parent directory exists
+    # Ensure remote parent directory exists.
+    # remote_relative comes from the file tree and may contain shell
+    # metacharacters; quote it for the remote shell.
     local remote_parent
     remote_parent=$(dirname "${REMOTE_DIR}/${remote_relative}")
     ssh -o "BatchMode=yes" -p "${REMOTE_PORT:-22}" \
         ${SSH_IDENTITY:+-i "$SSH_IDENTITY"} \
         "${REMOTE_USER}@${REMOTE_HOST}" \
-        "mkdir -p '$remote_parent'" 2>/dev/null || true
+        "mkdir -p $(shquote "$remote_parent")" 2>/dev/null || true
 
     # shellcheck disable=SC2086
     rsync $rsync_opts -e "$ssh_cmd" "$local_path" "$remote_dest"
@@ -551,9 +591,14 @@ remote_delete_file() {
     local ssh_cmd
     ssh_cmd=$(build_ssh_cmd)
 
+    # remote_relative is attacker-influenceable (it is just a file name);
+    # quote the full path for the remote shell to prevent command injection.
+    local remote_target
+    remote_target=$(shquote "${REMOTE_DIR}/${remote_relative}")
+
     # shellcheck disable=SC2086
     $ssh_cmd "${REMOTE_USER}@${REMOTE_HOST}" \
-        "rm -rf '${REMOTE_DIR}/${remote_relative}'" 2>/dev/null
+        "rm -rf $remote_target" 2>/dev/null
 }
 
 # Delete a local file
@@ -606,9 +651,16 @@ backup_remote_file() {
 
     local backup_path="${backup_base}/${relative_path}.${timestamp}"
 
+    # relative_path / backup_path embed a file name; quote every path for the
+    # remote shell to prevent command injection.
+    local q_backup_parent q_source q_backup
+    q_backup_parent=$(shquote "$(dirname "$backup_path")")
+    q_source=$(shquote "${REMOTE_DIR}/${relative_path}")
+    q_backup=$(shquote "$backup_path")
+
     # shellcheck disable=SC2086
     $ssh_cmd "${REMOTE_USER}@${REMOTE_HOST}" \
-        "mkdir -p '$(dirname "$backup_path")' && cp -a '${REMOTE_DIR}/${relative_path}' '$backup_path'" 2>/dev/null || true
+        "mkdir -p $q_backup_parent && cp -a $q_source $q_backup" 2>/dev/null || true
 
     log_debug "Backed up remote: $relative_path"
 }
@@ -646,7 +698,28 @@ acquire_lock() {
     mkdir -p "$state_dir"
     LOCK_FILE="${state_dir}/${profile}.lock"
 
-    # If a lock exists, check whether the owning process is still alive.
+    # Preferred: kernel advisory lock via flock. The lock lives on an open file
+    # descriptor held for the whole run, so the kernel releases it automatically
+    # if the process dies. This means there is no check-then-act race and no
+    # stale lock files to reason about.
+    if command -v flock >/dev/null 2>&1; then
+        # Append-open (does not truncate a lock another process may hold).
+        exec 200>>"$LOCK_FILE"
+        if ! flock -n "$LOCK_FD"; then
+            local lock_pid
+            lock_pid=$(head -1 "$LOCK_FILE" 2>/dev/null || echo "")
+            log_error "Another sync is already running${lock_pid:+ (PID: $lock_pid)}"
+            exec 200>&- 2>/dev/null || true
+            return 1
+        fi
+        LOCK_USES_FLOCK=1
+        # We exclusively hold the lock; safe to record our PID for diagnostics.
+        printf '%s\n' "$$" >| "$LOCK_FILE"
+        log_debug "Lock acquired via flock: $LOCK_FILE (PID $$)"
+        return 0
+    fi
+
+    # Fallback (no flock available): best-effort PID lock.
     if [[ -f "$LOCK_FILE" ]]; then
         local lock_pid
         lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
@@ -673,6 +746,16 @@ acquire_lock() {
 }
 
 release_lock() {
+    if (( LOCK_USES_FLOCK )); then
+        # Closing the descriptor releases the kernel lock. Deliberately do NOT
+        # unlink the file: removing it while holding flock can let two processes
+        # acquire locks on different inodes for the same path.
+        exec 200>&- 2>/dev/null || true
+        LOCK_USES_FLOCK=0
+        log_debug "Lock released (flock): ${LOCK_FILE:-}"
+        return 0
+    fi
+
     if [[ -n "${LOCK_FILE:-}" ]] && [[ -f "$LOCK_FILE" ]]; then
         rm -f "$LOCK_FILE"
         log_debug "Lock released: $LOCK_FILE"
