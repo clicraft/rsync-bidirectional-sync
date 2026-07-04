@@ -232,6 +232,24 @@ sync-client -p work -v -n
 - **Retry logic** - Configurable retries with backoff for network issues
 - **Version mismatch detection** - Pre-flight checks warn if local and remote run different versions (cached daily)
 
+## Known Limitations
+
+- **Change detection is mtime + size** (not content hash). An edit that keeps the
+  same size and restores the original mtime (e.g. `touch -r`, some editors/build
+  tools) may go undetected. `CHECKSUM_VERIFY=true` only re-checks files already
+  flagged as conflicts; it does not change initial detection.
+- **Empty directories are not tracked.** The manifest records files and symlinks
+  only, so an empty directory is never propagated, and a directory that becomes
+  empty after its files are deleted may remain on the other side.
+- **"newest" relies on synchronized clocks.** If the two hosts' clocks disagree,
+  `CONFLICT_STRATEGY=newest` can keep the older edit. A pre-flight warning fires
+  past `CLOCK_SKEW_WARN_SECONDS`; keep both machines on NTP.
+- **One profile per tree.** Locks are per-profile; running two profiles against
+  the same/overlapping `LOCAL_DIR` concurrently is unsupported.
+- **Shared/multi-user trees.** If a *different, less-trusted* user can write into
+  `LOCAL_DIR`/`REMOTE_DIR` while a sync runs, a directory-symlink swap race
+  (TOCTOU) is possible. Intended for single-user or same-trust-domain trees.
+
 ## Security
 
 ### SSH host key verification (recommended hardening)
