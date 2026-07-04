@@ -188,7 +188,7 @@ sync-client -p work -v -n
 | Command | Description |
 |---------|-------------|
 | `sync` | Run bidirectional sync (default) |
-| `status` | Show pending changes without syncing |
+| `status` | Show pending changes without syncing (exit code: 0 = in sync, 1 = changes pending) |
 | `reset-state` | Clear manifest, treat next sync as first sync |
 | `show-exclusions` | Show all active exclusion rules |
 | `init-syncignore [TPL]` | Create `.syncignore` from template |
@@ -224,7 +224,9 @@ sync-client -p work -v -n
 - **Manifest-based deletions** - Only propagates intentional deletes
 - **Backup on conflict** - Optional backup before overwriting
 - **Dry-run mode** - Preview all changes safely
-- **Partial transfer resume** - rsync `--partial` flag for interrupted transfers
+- **Crash-safe transfers** - interrupted transfers are quarantined in `.sync-partial` (rsync `--partial-dir`) so a truncated file never overwrites the good copy; resumable on the next run
+- **Atomic state save** - the manifest is written via a temp file + rename, so a crash mid-save can't corrupt sync state
+- **Retry with backoff** - transient network failures are retried (`MAX_RETRIES`/`RETRY_DELAY`)
 - **`.syncignore` delete protection** - Files matching `.syncignore` rules are protected from deletion propagation
 - **State preservation on error** - Manifest only saved after full success
 - **Retry logic** - Configurable retries with backoff for network issues

@@ -25,6 +25,9 @@ fi
 info()    { printf "${C_GREEN}  [OK]${C_RESET}    %s\n" "$*"; }
 warn()    { printf "${C_YELLOW}  [WARN]${C_RESET}  %s\n" "$*"; }
 error()   { printf "${C_RED}  [ERROR]${C_RESET} %s\n" "$*" >&2; }
+# Strip control bytes from remote-supplied strings before display, so a
+# malicious/compromised remote can't inject terminal escape sequences.
+sanitize() { printf -v "$1" '%s' "${2//[[:cntrl:]]/?}"; }
 step()    { printf "\n${C_BOLD}${C_BLUE}  STEP %s: %s${C_RESET}\n\n" "$1" "$2"; }
 banner()  { printf "\n${C_BOLD}%s${C_RESET}\n" "$*"; }
 dim()     { printf "${C_DIM}%s${C_RESET}" "$*"; }
@@ -458,6 +461,24 @@ main() {
     ask "SSH port" "${REMOTE_PORT:-22}"
     local remote_port="$REPLY"
 
+    # Validate before these values reach a `bash -c ".../dev/tcp/$host/$port"`
+    # connectivity probe and a `sed` that writes them into the config file
+    # (which is later sourced as bash). Without this, a value like
+    # '22;touch ~/pwned;#' would execute now and/or persist as a backdoor that
+    # runs on every future sync. Mirrors sync-lib.sh validate_config().
+    if ! [[ "$remote_user" =~ ^[a-zA-Z0-9_][a-zA-Z0-9._-]*$ ]]; then
+        error "Invalid username (letters/digits/dot/dash/underscore, no leading dash): $remote_user"
+        exit 1
+    fi
+    if ! [[ "$remote_host" =~ ^[a-zA-Z0-9_]([a-zA-Z0-9._:-]*)?$ ]]; then
+        error "Invalid hostname/IP (no leading dash or shell metacharacters): $remote_host"
+        exit 1
+    fi
+    if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+        error "SSH port must be a number: $remote_port"
+        exit 1
+    fi
+
     separator
 
     printf "  ${C_BOLD}Connection:${C_RESET} ${remote_user}@${remote_host}:${remote_port}\n"
@@ -536,7 +557,9 @@ main() {
             "${remote_user}@${remote_host}" "command -v rsync && rsync --version 2>/dev/null | head -1" 2>/dev/null || echo "")
 
         if [[ -n "$rsync_check" ]]; then
-            info "rsync is available on remote: $(echo "$rsync_check" | tail -1)"
+            local rsync_ver
+            sanitize rsync_ver "$(echo "$rsync_check" | tail -1)"
+            info "rsync is available on remote: $rsync_ver"
         else
             warn "rsync not found on remote. Install it:"
             printf "    ${C_CYAN}ssh -p $remote_port ${remote_user}@${remote_host} 'sudo apt install rsync'${C_RESET}\n"

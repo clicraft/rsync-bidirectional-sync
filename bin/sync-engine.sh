@@ -14,6 +14,7 @@ SYNC_DELETED_REMOTE=0
 SYNC_CONFLICTS=0
 SYNC_SKIPPED=0
 SYNC_ERRORS=0
+SYNC_SKIPPED_PATHS=()   # paths left unresolved by CONFLICT_STRATEGY=skip
 
 reset_counters() {
     SYNC_PUSHED=0
@@ -23,6 +24,7 @@ reset_counters() {
     SYNC_CONFLICTS=0
     SYNC_SKIPPED=0
     SYNC_ERRORS=0
+    SYNC_SKIPPED_PATHS=()
 }
 
 # ============================================================================
@@ -70,9 +72,12 @@ resolve_conflict() {
             ;;
 
         backup)
-            # Backup both, then apply newest
+            # Backup both, then apply newest. When BACKUP_ON_CONFLICT=true the
+            # execute_push/execute_pull path already backs up the losing side, so
+            # only back up explicitly here when that safety net is off (avoids a
+            # redundant double-backup of the loser).
             log_info "  Conflict resolution (backup): backing up both versions"
-            if [[ "${DRY_RUN:-false}" != "true" ]]; then
+            if [[ "${DRY_RUN:-false}" != "true" ]] && [[ "${BACKUP_ON_CONFLICT:-false}" != "true" ]]; then
                 backup_local_file "$path"
                 backup_remote_file "$path"
             fi
@@ -126,7 +131,7 @@ execute_push() {
 
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         log_info "  [DRY-RUN] Would push: $path"
-        (( SYNC_PUSHED++ ))
+        SYNC_PUSHED=$(( SYNC_PUSHED + 1 ))
         return 0
     fi
 
@@ -135,11 +140,11 @@ execute_push() {
     fi
 
     if rsync_push_file "${LOCAL_DIR}/${path}" "$path"; then
-        (( SYNC_PUSHED++ ))
+        SYNC_PUSHED=$(( SYNC_PUSHED + 1 ))
         log_debug "  Push successful: $path"
     else
         log_error "  Push failed: $path"
-        (( SYNC_ERRORS++ ))
+        SYNC_ERRORS=$(( SYNC_ERRORS + 1 ))
     fi
 }
 
@@ -150,7 +155,7 @@ execute_pull() {
 
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         log_info "  [DRY-RUN] Would pull: $path"
-        (( SYNC_PULLED++ ))
+        SYNC_PULLED=$(( SYNC_PULLED + 1 ))
         return 0
     fi
 
@@ -159,11 +164,11 @@ execute_pull() {
     fi
 
     if rsync_pull_file "$path" "${LOCAL_DIR}/${path}"; then
-        (( SYNC_PULLED++ ))
+        SYNC_PULLED=$(( SYNC_PULLED + 1 ))
         log_debug "  Pull successful: $path"
     else
         log_error "  Pull failed: $path"
-        (( SYNC_ERRORS++ ))
+        SYNC_ERRORS=$(( SYNC_ERRORS + 1 ))
     fi
 }
 
@@ -174,7 +179,7 @@ execute_delete_local() {
 
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         log_info "  [DRY-RUN] Would delete local: $path"
-        (( SYNC_DELETED_LOCAL++ ))
+        SYNC_DELETED_LOCAL=$(( SYNC_DELETED_LOCAL + 1 ))
         return 0
     fi
 
@@ -183,7 +188,7 @@ execute_delete_local() {
     fi
 
     local_delete_file "$path"
-    (( SYNC_DELETED_LOCAL++ ))
+    SYNC_DELETED_LOCAL=$(( SYNC_DELETED_LOCAL + 1 ))
     log_debug "  Local delete successful: $path"
 }
 
@@ -194,7 +199,7 @@ execute_delete_remote() {
 
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         log_info "  [DRY-RUN] Would delete remote: $path"
-        (( SYNC_DELETED_REMOTE++ ))
+        SYNC_DELETED_REMOTE=$(( SYNC_DELETED_REMOTE + 1 ))
         return 0
     fi
 
@@ -203,7 +208,7 @@ execute_delete_remote() {
     fi
 
     remote_delete_file "$path"
-    (( SYNC_DELETED_REMOTE++ ))
+    SYNC_DELETED_REMOTE=$(( SYNC_DELETED_REMOTE + 1 ))
     log_debug "  Remote delete successful: $path"
 }
 
@@ -249,8 +254,11 @@ run_sync() {
     local prev_manifest
     prev_manifest=$(load_manifest "$manifest_file")
 
+    # First sync is determined by the ABSENCE of a saved manifest file, not by
+    # empty content: two empty trees produce an empty (but real) manifest, and
+    # treating that as "first sync" forever would re-run the merge each time.
     local is_first_sync=0
-    if [[ -z "$prev_manifest" ]]; then
+    if [[ ! -f "$manifest_file" ]]; then
         is_first_sync=1
         log_info "First sync detected - will merge both sides"
     fi
@@ -313,7 +321,9 @@ run_sync() {
                 ;;
 
             CONFLICT)
-                (( SYNC_CONFLICTS++ ))
+                # Capture the path before any call that might reuse $path
+                # internally, so resolution operates on the right entry.
+                local conflict_path="$path"
 
                 # Get entries for resolution
                 declare -A _tmp_local=()
@@ -321,30 +331,37 @@ run_sync() {
                 parse_manifest "$local_manifest" _tmp_local
                 parse_manifest "$remote_manifest" _tmp_remote
 
-                local local_entry="${_tmp_local[$path]:-}"
-                local remote_entry="${_tmp_remote[$path]:-}"
+                local local_entry="${_tmp_local[$conflict_path]:-}"
+                local remote_entry="${_tmp_remote[$conflict_path]:-}"
 
-                # Verify it's a real conflict (checksum check if enabled)
-                if ! verify_conflict_with_checksum "$path"; then
+                # Verify it's a real conflict (checksum check if enabled) BEFORE
+                # counting it, so checksum-identical false positives aren't
+                # reported as conflicts.
+                if ! verify_conflict_with_checksum "$conflict_path"; then
                     log_info "  Conflict resolved: files are identical (checksum match)"
                     unset _tmp_local _tmp_remote
                     continue
                 fi
 
-                # Resolve conflict
+                SYNC_CONFLICTS=$(( SYNC_CONFLICTS + 1 ))
+
+                # Resolve conflict. _IS_CONFLICT must stay 1 across the
+                # execute_push/execute_pull call so their backup-the-loser logic
+                # actually fires; reset it only after the action completes.
                 local resolution
                 _IS_CONFLICT=1
-                resolution=$(resolve_conflict "$path" "$local_entry" "$remote_entry")
-                _IS_CONFLICT=0
+                resolution=$(resolve_conflict "$conflict_path" "$local_entry" "$remote_entry")
 
                 case "$resolution" in
-                    push) execute_push "$path" ;;
-                    pull) execute_pull "$path" ;;
+                    push) execute_push "$conflict_path" ;;
+                    pull) execute_pull "$conflict_path" ;;
                     skip)
-                        (( SYNC_SKIPPED++ ))
-                        log_info "  Skipped: $path"
+                        SYNC_SKIPPED=$(( SYNC_SKIPPED + 1 ))
+                        SYNC_SKIPPED_PATHS+=("$conflict_path")
+                        log_info "  Skipped: $conflict_path"
                         ;;
                 esac
+                _IS_CONFLICT=0
 
                 unset _tmp_local _tmp_remote
                 ;;
@@ -363,8 +380,11 @@ run_sync() {
             local post_local_manifest post_remote_manifest
             post_local_manifest=$(generate_local_manifest "$LOCAL_DIR")
             post_remote_manifest=$(generate_remote_manifest "$REMOTE_USER" "$REMOTE_HOST" "${REMOTE_PORT:-22}" "$REMOTE_DIR")
-            local merged
-            merged=$(merge_manifests "$post_local_manifest" "$post_remote_manifest" "$actions")
+            local merged skipped_list=""
+            if (( ${#SYNC_SKIPPED_PATHS[@]} > 0 )); then
+                skipped_list=$(printf '%s\n' "${SYNC_SKIPPED_PATHS[@]}")
+            fi
+            merged=$(merge_manifests "$post_local_manifest" "$post_remote_manifest" "$actions" "$skipped_list")
             save_manifest "$merged" "$manifest_file"
             log_info "Sync state saved"
         else
@@ -472,6 +492,10 @@ run_status() {
     fi
 
     echo ""
+
+    # Exit-code contract (git-diff-style): 0 = in sync, 1 = changes pending.
+    (( has_changes )) && return 1
+    return 0
 }
 
 # ============================================================================

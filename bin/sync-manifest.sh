@@ -33,9 +33,12 @@ generate_local_manifest() {
             exclude_args+=(-not -path "*/${clean}" -not -path "*/${clean}/*")
         done
     fi
-    # Always exclude sync internal dirs
+    # Always exclude sync internal dirs (backup dir honors the configured name)
+    local _bdir="${BACKUP_DIR:-.sync-backups}"
+    exclude_args+=(-not -path "*/${_bdir}" -not -path "*/${_bdir}/*")
     exclude_args+=(-not -path "*/.sync-backups" -not -path "*/.sync-backups/*")
     exclude_args+=(-not -path "*/.sync-state" -not -path "*/.sync-state/*")
+    exclude_args+=(-not -path "*/.sync-partial" -not -path "*/.sync-partial/*")
 
     (
         cd "$dir" || return 1
@@ -60,7 +63,10 @@ generate_local_manifest() {
                 if [[ -L "$file" ]]; then
                     ftype="l"
                     mtime=$(stat -c '%Y' "$file" 2>/dev/null || echo 0)
-                    size=0
+                    # lstat st_size of a symlink = length of its target path, so
+                    # a retarget that changes the length is detected even if the
+                    # mtime is unchanged (better than a hardcoded 0).
+                    size=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
                 else
                     ftype="f"
                     mtime=$(stat -c '%Y' "$file" 2>/dev/null || echo 0)
@@ -104,8 +110,12 @@ generate_remote_manifest() {
             exclude_script+=" -not -path '*/${safe}' -not -path '*/${safe}/*'"
         done
     fi
+    local _bdir="${BACKUP_DIR:-.sync-backups}"
+    local _bdir_safe="${_bdir//\'/\'\\\'\'}"
+    exclude_script+=" -not -path '*/${_bdir_safe}' -not -path '*/${_bdir_safe}/*'"
     exclude_script+=" -not -path '*/.sync-backups' -not -path '*/.sync-backups/*'"
     exclude_script+=" -not -path '*/.sync-state' -not -path '*/.sync-state/*'"
+    exclude_script+=" -not -path '*/.sync-partial' -not -path '*/.sync-partial/*'"
 
     # Run find+stat on remote and pipe back
     # We use a heredoc-style remote script for reliability
@@ -124,7 +134,7 @@ find . $exclude_script \( -type f -o -type l \) -print0 2>/dev/null \\
         if [ -L "\$file" ]; then
             ftype="l"
             mtime=\$(stat -c '%Y' "\$file" 2>/dev/null || echo 0)
-            size=0
+            size=\$(stat -c '%s' "\$file" 2>/dev/null || echo 0)
         else
             ftype="f"
             mtime=\$(stat -c '%Y' "\$file" 2>/dev/null || echo 0)
@@ -178,8 +188,18 @@ save_manifest() {
     output_dir=$(dirname "$output_file")
     mkdir -p "$output_dir"
 
-    echo "$manifest_content" > "$output_file"
-    log_debug "Manifest saved: $output_file ($(echo "$manifest_content" | wc -l) entries)"
+    # Write to a temp file in the same directory, then atomically rename into
+    # place. A crash/kill/disk-full mid-write must never leave a truncated
+    # manifest — an empty/partial manifest reads as "first sync" and would
+    # resurrect files that were previously deleted-and-propagated.
+    local tmp_file
+    tmp_file=$(mktemp "${output_file}.XXXXXX") || {
+        log_error "Failed to create temp manifest file next to: $output_file"
+        return 1
+    }
+    printf '%s\n' "$manifest_content" > "$tmp_file"
+    mv -f "$tmp_file" "$output_file"
+    log_debug "Manifest saved: $output_file ($(printf '%s\n' "$manifest_content" | grep -c '[^[:space:]]' || true) entries)"
 }
 
 # Load manifest from a file
@@ -214,8 +234,29 @@ parse_manifest() {
     local content="$1"
     local -n _target_array=$2
 
+    # These MUST be local: parse_manifest is called directly (not in a subshell)
+    # from inside run_sync's `while read action path` loop, and a leaked `path`
+    # would clobber that loop's current path, breaking conflict handling.
+    local path mtime size ftype
+
     while IFS=$'\t' read -r path mtime size ftype; do
         [[ -z "$path" ]] && continue
+
+        # Reject paths that are absolute or contain a '..' component. A real
+        # find-generated manifest can never produce these; only a malicious or
+        # compromised remote can, and honoring them would let a PULL write
+        # outside LOCAL_DIR (path traversal / arbitrary file write).
+        if [[ "$path" == /* || "$path" == ".." || "$path" == "../"* || "$path" == *"/../"* || "$path" == *"/.." ]]; then
+            log_warn "Skipping manifest entry with unsafe path (absolute or '..'): $path"
+            continue
+        fi
+
+        # Coerce non-numeric mtime/size to 0. These fields are later used in
+        # arithmetic ((...)) comparisons; an attacker-controlled remote value
+        # like 'x[$(cmd)]' would otherwise execute during arithmetic evaluation.
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
         _target_array["$path"]="${mtime}${_FIELD_SEP}${size}${_FIELD_SEP}${ftype}"
     done <<< "$content"
 }
@@ -327,8 +368,13 @@ three_way_diff() {
             printf 'PULL\t%s\n' "$path"
 
         elif (( in_prev && in_local && !in_remote )); then
-            # Was in prev and local, gone from remote -> deleted remotely
-            if [[ "${PROPAGATE_DELETES:-true}" == "true" ]]; then
+            # Was in prev and local, gone from remote -> deleted remotely.
+            # But if the surviving local copy was ALSO modified since prev, this
+            # is a delete-vs-modify race: treat it as a conflict, not a silent
+            # delete of the user's new edit.
+            if entry_changed "$local_entry" "$prev_entry"; then
+                printf 'CONFLICT\t%s\n' "$path"
+            elif [[ "${PROPAGATE_DELETES:-true}" == "true" ]]; then
                 printf 'DELETE_LOCAL\t%s\n' "$path"
             else
                 # Don't delete, push local version back
@@ -336,8 +382,12 @@ three_way_diff() {
             fi
 
         elif (( in_prev && !in_local && in_remote )); then
-            # Was in prev and remote, gone from local -> deleted locally
-            if [[ "${PROPAGATE_DELETES:-true}" == "true" ]]; then
+            # Was in prev and remote, gone from local -> deleted locally.
+            # Mirror of the above: if the surviving remote copy changed since
+            # prev, it's a delete-vs-modify conflict, not a silent delete.
+            if entry_changed "$remote_entry" "$prev_entry"; then
+                printf 'CONFLICT\t%s\n' "$path"
+            elif [[ "${PROPAGATE_DELETES:-true}" == "true" ]]; then
                 printf 'DELETE_REMOTE\t%s\n' "$path"
             else
                 # Don't delete, pull remote version back
@@ -353,21 +403,6 @@ three_way_diff() {
 }
 
 # ============================================================================
-# FIRST SYNC DETECTION
-# ============================================================================
-
-# On first sync (no previous manifest), we merge both sides
-# New files on either side get synced, identical files are unchanged
-# Different files with same name are conflicts
-first_sync_diff() {
-    local local_content="$1"
-    local remote_content="$2"
-
-    # With no previous manifest, treat it as empty
-    three_way_diff "" "$local_content" "$remote_content"
-}
-
-# ============================================================================
 # MANIFEST MERGE
 # ============================================================================
 
@@ -377,6 +412,9 @@ merge_manifests() {
     local local_content="$1"
     local remote_content="$2"
     local actions="$3"
+    local skipped_paths="${4:-}"
+
+    local path mtime size ftype action
 
     # Start with the local manifest as base
     declare -A merged=()
@@ -399,6 +437,19 @@ merge_manifests() {
                 ;;
         esac
     done <<< "$actions"
+
+    # Remove paths whose conflict was left unresolved (CONFLICT_STRATEGY=skip):
+    # the two sides are still deliberately different, so we must NOT record
+    # either side's metadata as the new baseline. Dropping them keeps the path
+    # out of the next "prev" manifest, so it re-surfaces as a CONFLICT every run
+    # until a human resolves it, instead of silently collapsing to a one-sided
+    # PULL/PUSH on the following sync.
+    if [[ -n "$skipped_paths" ]]; then
+        while IFS= read -r path; do
+            [[ -z "$path" ]] && continue
+            unset "merged[$path]" 2>/dev/null || true
+        done <<< "$skipped_paths"
+    fi
 
     # Output merged manifest (while-read so paths with spaces/tabs survive)
     while IFS= read -r path; do

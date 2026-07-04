@@ -159,9 +159,11 @@ rotate_logs() {
         fi
     done < <(find "$log_dir" -name 'sync-*.log' -print0 2>/dev/null)
 
-    # Keep only the most recent N logs
+    # Keep only the most recent N logs. Guard the pipeline: under `set -o
+    # pipefail` a transient find error (e.g. a file vanishing mid-walk) would
+    # otherwise make this assignment fail and abort the whole run.
     local count
-    count=$(find "$log_dir" -name 'sync-*.log' 2>/dev/null | wc -l)
+    count=$(find "$log_dir" -name 'sync-*.log' 2>/dev/null | wc -l) || count=0
     if (( count > max_files )); then
         find "$log_dir" -name 'sync-*.log' -printf '%T@ %p\n' 2>/dev/null \
             | sort -n \
@@ -275,6 +277,26 @@ validate_config() {
     # Validate port
     if [[ -n "${REMOTE_PORT:-}" ]] && ! [[ "$REMOTE_PORT" =~ ^[0-9]+$ ]]; then
         log_error "REMOTE_PORT must be a number: $REMOTE_PORT"
+        errors=$(( errors + 1 ))
+    fi
+
+    # Numeric knobs used in arithmetic ((...)) contexts. A non-numeric value
+    # (e.g. MAX_LOG_SIZE="unlimited") triggers a fatal set -u error deep inside
+    # rotate_logs/rotate_backups, aborting every subcommand with a cryptic
+    # message. Validate them up front with a clear error instead.
+    local _numvar
+    for _numvar in MAX_LOG_SIZE MAX_LOG_FILES BACKUP_MAX_AGE_DAYS MAX_RETRIES RETRY_DELAY SSH_TIMEOUT RSYNC_TIMEOUT BANDWIDTH_LIMIT; do
+        if [[ -n "${!_numvar:-}" ]] && ! [[ "${!_numvar}" =~ ^[0-9]+$ ]]; then
+            log_error "${_numvar} must be a non-negative integer: ${!_numvar}"
+            errors=$(( errors + 1 ))
+        fi
+    done
+
+    # MAX_FILE_SIZE feeds rsync --max-size and legitimately takes a unit suffix
+    # (e.g. 100M, 1G). It is also word-split unquoted into the rsync command, so
+    # constrain it to digits plus an optional single K/M/G/T[+B] suffix.
+    if [[ -n "${MAX_FILE_SIZE:-}" ]] && ! [[ "$MAX_FILE_SIZE" =~ ^[0-9]+([KkMmGgTt][Bb]?)?$ ]]; then
+        log_error "MAX_FILE_SIZE must be a number with an optional K/M/G/T suffix: $MAX_FILE_SIZE"
         errors=$(( errors + 1 ))
     fi
 
@@ -463,7 +485,13 @@ build_rsync_opts() {
 
     opts+=(-a)                    # archive mode
     opts+=(-s)                    # protect-args: no remote shell expansion of paths
-    opts+=(--partial)             # keep partial files for resume
+    # Quarantine in-progress data in a side dir instead of leaving a truncated
+    # file at the real destination path. On interruption (Ctrl-C, dropped link,
+    # sleep) the destination keeps its previous good content; a resumed transfer
+    # completes from the partial. Bare --partial would expose the truncated file
+    # and the next sync could propagate that corruption over the good copy.
+    # (.sync-partial is excluded from manifest scans.)
+    opts+=(--partial-dir=.sync-partial)
     opts+=(--progress)            # show progress
     opts+=(--human-readable)      # human readable sizes
     opts+=(--timeout="${RSYNC_TIMEOUT:-30}")
@@ -487,60 +515,33 @@ build_rsync_opts() {
     echo "${opts[@]}"
 }
 
-build_exclusions() {
-    local exclusions=()
-
-    if [[ -n "${EXCLUDE_PATTERNS+x}" ]]; then
-        for pattern in "${EXCLUDE_PATTERNS[@]}"; do
-            exclusions+=(--exclude="$pattern")
-        done
-    fi
-
-    # Always exclude the state/backup dirs
-    exclusions+=(--exclude=".sync-backups/")
-    exclusions+=(--exclude=".sync-state/")
-
-    echo "${exclusions[@]}"
-}
-
-robust_rsync() {
-    local src="$1"
-    local dst="$2"
+# Run an rsync invocation with configurable retries + backoff.
+# All arguments are passed straight through to rsync. Honors MAX_RETRIES /
+# RETRY_DELAY so a transient network failure gets retried instead of counting
+# as a hard error on the first blip.
+rsync_transfer() {
     local max_retries="${MAX_RETRIES:-3}"
     local retry_delay="${RETRY_DELAY:-5}"
     local attempt=0
-
-    local rsync_opts
-    rsync_opts=$(build_rsync_opts)
-
-    local exclusions
-    exclusions=$(build_exclusions)
+    local rc=0
 
     while (( attempt < max_retries )); do
-        (( attempt++ ))
+        attempt=$(( attempt + 1 ))
 
         if (( attempt > 1 )); then
             log_warn "Retry attempt $attempt/$max_retries (waiting ${retry_delay}s)..."
             sleep "$retry_delay"
         fi
 
-        local ssh_cmd
-        ssh_cmd=$(build_ssh_cmd)
-
-        log_debug "rsync $rsync_opts $exclusions ${RSYNC_EXTRA_OPTS:-} $src $dst"
-
-        # shellcheck disable=SC2086
-        if rsync $rsync_opts $exclusions ${RSYNC_EXTRA_OPTS:-} -e "$ssh_cmd" "$src" "$dst"; then
-            log_debug "rsync completed successfully"
+        if rsync "$@"; then
             return 0
         fi
-
-        local exit_code=$?
-        log_warn "rsync failed with exit code $exit_code (attempt $attempt/$max_retries)"
+        rc=$?
+        log_warn "rsync failed with exit code $rc (attempt $attempt/$max_retries)"
     done
 
-    log_error "rsync failed after $max_retries attempts"
-    return 1
+    log_error "rsync failed after $max_retries attempt(s)"
+    return "$rc"
 }
 
 # Transfer a single file to remote
@@ -557,18 +558,21 @@ rsync_push_file() {
 
     log_debug "Pushing: $remote_relative"
 
-    # Ensure remote parent directory exists.
-    # remote_relative comes from the file tree and may contain shell
-    # metacharacters; quote it for the remote shell.
-    local remote_parent
+    # Ensure the remote parent exists, and clear a wrong-type destination: if the
+    # target path currently exists as a directory (e.g. it used to be a dir and
+    # is now a file), rsync would nest the file inside it instead of replacing
+    # it. remote_relative may contain shell metacharacters; quote for the remote.
+    local remote_parent q_parent q_dest
     remote_parent=$(dirname "${REMOTE_DIR}/${remote_relative}")
+    q_parent=$(shquote "$remote_parent")
+    q_dest=$(shquote "${REMOTE_DIR}/${remote_relative}")
     ssh -o "BatchMode=yes" -p "${REMOTE_PORT:-22}" \
         ${SSH_IDENTITY:+-i "$SSH_IDENTITY"} \
         "${REMOTE_USER}@${REMOTE_HOST}" \
-        "mkdir -p $(shquote "$remote_parent")" 2>/dev/null || true
+        "mkdir -p $q_parent; [ -d $q_dest ] && rm -rf $q_dest || true" 2>/dev/null || true
 
     # shellcheck disable=SC2086
-    rsync $rsync_opts -e "$ssh_cmd" "$local_path" "$remote_dest"
+    rsync_transfer $rsync_opts ${RSYNC_EXTRA_OPTS:-} -e "$ssh_cmd" "$local_path" "$remote_dest"
 }
 
 # Transfer a single file from remote
@@ -585,13 +589,21 @@ rsync_pull_file() {
 
     log_debug "Pulling: $remote_relative"
 
-    # Ensure local parent directory exists
+    # Ensure local parent exists; clear a wrong-type destination (directory where
+    # we expect a file) so rsync replaces rather than nests. Back it up first if
+    # backups are enabled, so nothing is lost silently.
     local local_parent
     local_parent=$(dirname "$local_path")
     mkdir -p "$local_parent"
+    if [[ -d "$local_path" ]]; then
+        if [[ "${BACKUP_ON_CONFLICT:-true}" == "true" ]]; then
+            backup_local_file "$remote_relative"
+        fi
+        rm -rf "$local_path"
+    fi
 
     # shellcheck disable=SC2086
-    rsync $rsync_opts -e "$ssh_cmd" "$remote_src" "$local_path"
+    rsync_transfer $rsync_opts ${RSYNC_EXTRA_OPTS:-} -e "$ssh_cmd" "$remote_src" "$local_path"
 }
 
 # Delete a file on remote
@@ -817,16 +829,16 @@ require_command() {
 check_prerequisites() {
     local errors=0
 
-    require_command rsync || (( errors++ ))
-    require_command ssh || (( errors++ ))
-    require_command find || (( errors++ ))
-    require_command stat || (( errors++ ))
-    require_command sort || (( errors++ ))
+    require_command rsync || errors=$(( errors + 1 ))
+    require_command ssh || errors=$(( errors + 1 ))
+    require_command find || errors=$(( errors + 1 ))
+    require_command stat || errors=$(( errors + 1 ))
+    require_command sort || errors=$(( errors + 1 ))
 
     # Check bash version (need 4+ for associative arrays)
     if (( BASH_VERSINFO[0] < 4 )); then
         log_error "Bash 4.0+ is required (current: ${BASH_VERSION})"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if (( errors > 0 )); then
@@ -884,18 +896,4 @@ print_summary() {
     fi
 
     echo ""
-}
-
-# Format bytes to human readable
-format_bytes() {
-    local bytes="$1"
-    if (( bytes >= 1073741824 )); then
-        printf "%.1fG" "$(echo "$bytes / 1073741824" | bc -l)"
-    elif (( bytes >= 1048576 )); then
-        printf "%.1fM" "$(echo "$bytes / 1048576" | bc -l)"
-    elif (( bytes >= 1024 )); then
-        printf "%.1fK" "$(echo "$bytes / 1024" | bc -l)"
-    else
-        printf "%dB" "$bytes"
-    fi
 }

@@ -271,6 +271,25 @@ preflight_checks() {
     # Check remote directory
     check_remote_dir "$REMOTE_USER" "$REMOTE_HOST" "${REMOTE_PORT:-22}" "$REMOTE_DIR"
 
+    # Warn on clock skew between the two hosts. CONFLICT_STRATEGY=newest compares
+    # mtimes across machines, so a skewed remote clock can silently keep the
+    # chronologically-older edit. This only warns; it never blocks the sync.
+    local ssh_cmd_clk remote_epoch local_epoch skew
+    ssh_cmd_clk=$(build_ssh_cmd)
+    # shellcheck disable=SC2086
+    remote_epoch=$($ssh_cmd_clk "${REMOTE_USER}@${REMOTE_HOST}" "date +%s" 2>/dev/null || echo "")
+    local_epoch=$(date +%s)
+    if [[ "$remote_epoch" =~ ^[0-9]+$ ]]; then
+        skew=$(( remote_epoch - local_epoch )); skew=${skew#-}
+        if (( skew > ${CLOCK_SKEW_WARN_SECONDS:-120} )); then
+            log_warn "Clock skew between local and remote is ${skew}s — 'newest' conflict resolution may pick the wrong side. Consider enabling NTP on both hosts."
+        else
+            log_debug "Clock skew within tolerance: ${skew}s"
+        fi
+    else
+        log_debug "Could not determine remote clock for skew check"
+    fi
+
     # Check version mismatch with remote (cached: once per day per profile)
     local version_cache_dir="${STATE_DIR:-$HOME/.config/rsync-sync/state}"
     local version_cache_file="${version_cache_dir}/${PROFILE_NAME:-default}.remote-version"
@@ -299,6 +318,9 @@ preflight_checks() {
         # shellcheck disable=SC2086
         local remote_version
         remote_version=$($ssh_cmd "${REMOTE_USER}@${REMOTE_HOST}" "sync-client --version 2>/dev/null" 2>/dev/null || echo "unknown")
+        # Strip control bytes: this is remote-supplied and is both logged and
+        # persisted to a cache file that is read back on later runs.
+        sanitize_for_terminal remote_version "$remote_version"
         local local_version
         local_version=$(version)
         if [[ "$remote_version" == "unknown" ]]; then
@@ -398,7 +420,10 @@ main() {
                 exit 1
             fi
 
+            # run_status exits 0 when in sync, 1 when changes are pending
+            # (git-diff-style), so cron/monitoring can detect drift by exit code.
             run_status
+            exit $?
             ;;
 
         reset-state)
@@ -413,7 +438,7 @@ main() {
                     exit 0
                 fi
                 local count
-                count=$(find "$backup_dir" -type f 2>/dev/null | wc -l)
+                count=$(find "$backup_dir" -type f 2>/dev/null | wc -l) || count=0
                 if (( count == 0 )); then
                     log_info "No backups to delete"
                     exit 0
@@ -426,7 +451,7 @@ main() {
                         exit 0
                     fi
                 fi
-                find "$backup_dir" -type f -delete 2>/dev/null
+                find "$backup_dir" -type f -delete 2>/dev/null || true
                 find "$backup_dir" -mindepth 1 -type d -empty -delete 2>/dev/null || true
                 log_info "Deleted $count backup file(s)"
             else

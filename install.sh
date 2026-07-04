@@ -46,7 +46,7 @@ check_requirements() {
         info "Bash ${BASH_VERSION} (4.0+ required)"
     else
         error "Bash 4.0+ required (current: ${BASH_VERSION})"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     # rsync
@@ -56,7 +56,7 @@ check_requirements() {
         info "rsync $rsync_ver found"
     else
         error "rsync is not installed. Install: sudo apt install rsync"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     # ssh
@@ -64,7 +64,7 @@ check_requirements() {
         info "ssh found"
     else
         error "ssh is not installed. Install: sudo apt install openssh-client"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     # md5sum (for checksum verification)
@@ -80,7 +80,7 @@ check_requirements() {
             info "$cmd found"
         else
             error "$cmd is not installed"
-            (( errors++ ))
+            errors=$(( errors + 1 ))
         fi
     done
 
@@ -142,9 +142,17 @@ install_files() {
         info "Installed: $dst"
     done
 
-    # Inject git version into sync-lib.sh
+    # Inject git version into sync-lib.sh.
+    # Constrain to a safe charset first: the value comes from a git tag/branch
+    # ref, which can legitimately contain characters ("/`;$) that would break or
+    # inject into this sed replacement and end up executed on every future run
+    # (sync-lib.sh is sourced each invocation).
     local version
     version=$(git describe --tags --always --dirty 2>/dev/null || echo "unknown")
+    if ! [[ "$version" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        warn "Version string '$version' has unexpected characters; using 'unknown'"
+        version="unknown"
+    fi
     sed -i "s/^readonly SYNC_VERSION=.*/readonly SYNC_VERSION=\"$version\"/" "$BIN_DIR/sync-lib.sh"
     info "Version: $version"
 
@@ -223,7 +231,7 @@ setup_path() {
                 echo "# Added by rsync-bidirectional-sync installer" >> "$rc_file"
                 echo "$path_line" >> "$rc_file"
                 info "Updated: $rc_file"
-                (( shells_updated++ ))
+                shells_updated=$(( shells_updated + 1 ))
             fi
         fi
     done

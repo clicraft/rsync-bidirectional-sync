@@ -57,26 +57,26 @@ check_requirements() {
         info "Bash ${BASH_VERSION} (4.0+ required)"
     else
         error "Bash 4.0+ required (current: ${BASH_VERSION})"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if command -v rsync &>/dev/null; then
         info "rsync found"
     else
         error "rsync is not installed. Install: sudo apt install rsync"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if command -v ssh &>/dev/null; then
         info "ssh found"
     else
         error "ssh is not installed. Install: sudo apt install openssh-client"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if ! command -v curl &>/dev/null; then
         error "curl is required for remote install"
-        (( errors++ ))
+        errors=$(( errors + 1 ))
     fi
 
     if (( errors > 0 )); then
@@ -123,6 +123,13 @@ install_scripts() {
         version="${BRANCH}-g${commit_sha}"
     else
         version="${BRANCH}"
+    fi
+    # Constrain to a safe charset: $BRANCH is user-supplied and would otherwise
+    # break or inject into this sed replacement (the result is sourced on every
+    # run).
+    if ! [[ "$version" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        warn "Version string '$version' has unexpected characters; using 'unknown'"
+        version="unknown"
     fi
     sed -i "s/^readonly SYNC_VERSION=.*/readonly SYNC_VERSION=\"$version\"/" "$BIN_DIR/sync-lib.sh"
     info "Version: $version"
@@ -175,7 +182,7 @@ setup_path() {
                 echo "# Added by rsync-bidirectional-sync installer" >> "$rc_file"
                 echo "$path_line" >> "$rc_file"
                 info "Updated: $rc_file"
-                (( shells_updated++ ))
+                shells_updated=$(( shells_updated + 1 ))
             fi
         fi
     done
