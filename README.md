@@ -188,7 +188,7 @@ sync-client -p work -v -n
 | Command | Description |
 |---------|-------------|
 | `sync` | Run bidirectional sync (default) |
-| `status` | Show pending changes without syncing |
+| `status` | Show pending changes without syncing (exit code: 0 = in sync, 1 = changes pending) |
 | `reset-state` | Clear manifest, treat next sync as first sync |
 | `show-exclusions` | Show all active exclusion rules |
 | `init-syncignore [TPL]` | Create `.syncignore` from template |
@@ -224,11 +224,31 @@ sync-client -p work -v -n
 - **Manifest-based deletions** - Only propagates intentional deletes
 - **Backup on conflict** - Optional backup before overwriting
 - **Dry-run mode** - Preview all changes safely
-- **Partial transfer resume** - rsync `--partial` flag for interrupted transfers
+- **Crash-safe transfers** - interrupted transfers are quarantined in `.sync-partial` (rsync `--partial-dir`) so a truncated file never overwrites the good copy; resumable on the next run
+- **Atomic state save** - the manifest is written via a temp file + rename, so a crash mid-save can't corrupt sync state
+- **Retry with backoff** - transient network failures are retried (`MAX_RETRIES`/`RETRY_DELAY`)
 - **`.syncignore` delete protection** - Files matching `.syncignore` rules are protected from deletion propagation
 - **State preservation on error** - Manifest only saved after full success
 - **Retry logic** - Configurable retries with backoff for network issues
 - **Version mismatch detection** - Pre-flight checks warn if local and remote run different versions (cached daily)
+
+## Known Limitations
+
+- **Change detection is mtime + size** (not content hash). An edit that keeps the
+  same size and restores the original mtime (e.g. `touch -r`, some editors/build
+  tools) may go undetected. `CHECKSUM_VERIFY=true` only re-checks files already
+  flagged as conflicts; it does not change initial detection.
+- **Empty directories are not tracked.** The manifest records files and symlinks
+  only, so an empty directory is never propagated, and a directory that becomes
+  empty after its files are deleted may remain on the other side.
+- **"newest" relies on synchronized clocks.** If the two hosts' clocks disagree,
+  `CONFLICT_STRATEGY=newest` can keep the older edit. A pre-flight warning fires
+  past `CLOCK_SKEW_WARN_SECONDS`; keep both machines on NTP.
+- **One profile per tree.** Locks are per-profile; running two profiles against
+  the same/overlapping `LOCAL_DIR` concurrently is unsupported.
+- **Shared/multi-user trees.** If a *different, less-trusted* user can write into
+  `LOCAL_DIR`/`REMOTE_DIR` while a sync runs, a directory-symlink swap race
+  (TOCTOU) is possible. Intended for single-user or same-trust-domain trees.
 
 ## Security
 

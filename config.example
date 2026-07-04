@@ -78,10 +78,14 @@ BANDWIDTH_LIMIT=""
 MAX_FILE_SIZE=""
 
 # Use checksum verification for conflict detection (slower but more accurate)
-# When false, uses mtime + size comparison
+# When false, uses mtime + size comparison.
+# NOTE: this only re-checks files ALREADY flagged as conflicts; initial change
+# detection is still mtime+size. A same-size edit that preserves the mtime
+# (e.g. `touch -r`, some editors/build tools) can go undetected.
 CHECKSUM_VERIFY=false
 
-# Additional rsync options (appended to rsync command)
+# Additional rsync options (appended to every transfer). Trusted/advanced knob:
+# values are passed to rsync as-is.
 RSYNC_EXTRA_OPTS=""
 
 # ============================================================================
@@ -129,6 +133,19 @@ MAX_LOG_SIZE=10485760
 
 # Directory for storing sync state (manifests, lock files)
 STATE_DIR="$HOME/.config/rsync-sync/state"
+
+# IMPORTANT: each profile owns its own LOCAL_DIR/REMOTE_DIR. Locks are
+# per-profile, so pointing two profiles at the same (or overlapping) LOCAL_DIR
+# and running them concurrently is unsupported and can corrupt sync state.
+
+# ============================================================================
+# CLOCK SKEW
+# ============================================================================
+
+# CONFLICT_STRATEGY=newest compares modification times across the two machines.
+# If their clocks disagree by more than this many seconds, a pre-flight warning
+# is printed (the sync still runs). Keep both hosts on NTP for reliable results.
+CLOCK_SKEW_WARN_SECONDS=120
 
 # ============================================================================
 # NOTIFICATIONS (optional)
